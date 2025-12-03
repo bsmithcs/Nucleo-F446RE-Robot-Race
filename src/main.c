@@ -31,7 +31,7 @@
 /************************* Variables *************************/
 
 volatile uint32_t IR_reading;
-volatile int digit_select = 0;
+volatile int digit_select;
 
 volatile float time;
 volatile float initial_time;
@@ -40,6 +40,7 @@ volatile float initial_time;
 
 typedef enum operation_state
 {
+    stopped,
     following_line,
     seeking_opening,
     parking,
@@ -52,12 +53,6 @@ typedef enum movement_state
     stop,
     left,
     right,
-    // soft_left,
-    // soft_right,
-    /*
-    hard_left,
-    hard_right,
-    */
     forward
 } movement_e;
 volatile movement_e movement;
@@ -79,7 +74,6 @@ int get_time(void);
 /************************* Main *************************/
 int main(void)
 {
-
     /***** Enable necessary lines *****/
     // Enable AHB1 peripherals (GPIO ports)
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN    // GPIOC for BTN, PWM
@@ -93,9 +87,9 @@ int main(void)
                     | RCC_APB2ENR_SYSCFGEN; // For EXTI button interrupt
 
     /***** Initializations *****/
-    TIM2_Config();
-    TIM5_Config();
-    TIM8_Config();
+    TIM2_Config(); // Fast interrupt to update IR reading
+    TIM5_Config(); // Free-running timer to keep run-time
+    TIM8_Config(); // Timer used for PWM generation
 
     PWM_Output_PC6_Init();
     PWM_Output_PC9_Init();
@@ -104,8 +98,10 @@ int main(void)
     IR_Sensor_Init();
 
     movement = stop;
-    operation = following_line;
-    initial_time = -1.0;
+    operation = stopped; // Start with robot stopped...
+    digit_select = 0;    // Initialize for SSD
+    initial_time = -1.0; // Null value before run starts
+
     /***** Wait for Interrupt *****/
     while (1)
         ;
@@ -121,7 +117,8 @@ int main(void)
 /// using 1MHz prescaler. Used to flicker SSD selection.
 void TIM2_Config(void)
 {
-    TIM2->ARR = 1;                  // Auto-reload when CNT = XX: (period = XX usec)
+    TIM2->PSC = 15;                 // 16 MHz / 15+1 = 1 MHz -> us period
+    TIM2->ARR = 1000;               // Auto-reload when CNT = XX: (period = XX usec)
     TIM2->DIER |= TIM_DIER_UIE;     // Enable update interrupt
     TIM2->SR &= ~TIM_SR_UIF;        // Clear any pending interrupt
     NVIC_EnableIRQ(TIM2_IRQn);      // Enable TIM2 interrupt in NVIC
@@ -213,37 +210,34 @@ void servo_speed_update(void)
         left_pw = 1500;
         right_pw = 1500;
         break;
-    case left:
-        // left_pw = 1460;
-        // right_pw = 1400; // if messed up swap with right (below)
-        left_pw = 1460;
-        right_pw = 1400; // if messed up swap with right (below)
+    case left: // !TRY - Reversing right while left still
+        if (IR_reading == 0b1110)
+        {
+            left_pw = 1350;
+            right_pw = 1500;
+        }
+        else
+        {
+            left_pw = 1460;
+            right_pw = 1400;
+        }
         break;
-    case right:
-        // left_pw = 1580;
-        // right_pw = 1540; // if messed up swap with left (above)
-        left_pw = 1580;
-        right_pw = 1540; // if messed up swap with left (above)
+    case right: // !TRY - Reversing left while right still
+        if (IR_reading == 0b0111)
+        {
+
+            left_pw = 1500;
+            right_pw = 1650;
+        }
+        else
+        {
+            left_pw = 1580;
+            right_pw = 1540;
+        }
         break;
-    // case soft_left:
-    //     left_pw = 1460;
-    //     right_pw = 1430; // if messed up swap with right (below)
-    //     break;
-    // case soft_right:
-    //     left_pw = 1560;
-    //     right_pw = 1540; // if messed up swap with left (above)
-    //     break;
-    /*
-    case hard_left:
-        left_pw = 1440; right_pw = 1420;
-        break;
-    case hard_right:
-        left_pw = 1560; right_pw = 1580;
-        break;
-    */
     case forward:
-        left_pw = 1580;
-        right_pw = 1400;
+        right_pw = 1280;
+        left_pw = ((50 * (1500 - right_pw)) / 60) + 1500;
         break;
     }
 
@@ -256,11 +250,8 @@ void servo_speed_update(void)
 /// @return Integer version of IR reading (ie. 110 for centered on line)
 int get_time(void)
 {
-
     if (operation != following_line || initial_time == -1.0)
-    {
         return time / 100;
-    }
 
     time = TIM5->CNT - initial_time;
 
@@ -307,17 +298,20 @@ void EXTI15_10_IRQHandler(void)
     {                               // Check if the interrupt is from BTN_PIN
         EXTI->PR |= (1 << BTN_PIN); // Clear the pending interrupt
 
-        if (operation == following_line)
+        if (operation == stopped)
         {
+            operation = following_line;
             initial_time = TIM5->CNT;
+        }
+        else
+        {
+            operation = stopped;
         }
 
         if (movement == stop)
             movement = forward;
         else
-        {
             movement = stop;
-        }
     }
 }
 
@@ -349,40 +343,41 @@ void TIM2_IRQHandler(void)
             operation = seeking_opening;
         }
         // FORWARD Condition
-        else if ((IR_reading == 0b0110) | (IR_reading == 0b1111))
+        else if (IR_reading == 0b0110)
         {
             movement = forward;
         }
         // RIGHT Condition (Break into soft/hard turn?)
-        else if (
-            (IR_reading == 0b0001) | (IR_reading == 0b0010) | (IR_reading == 0b0011) | (IR_reading == 0b0111))
+        else if ((IR_reading == 0b0001) ||
+                 (IR_reading == 0b0010) ||
+                 (IR_reading == 0b0011) ||
+                 (IR_reading == 0b0111))
         {
             movement = right; // if messed up change to left
         }
         // LEFT Condition (Break into soft/hard turn?)
-        else if (
-            (IR_reading == 0b0100) | (IR_reading == 0b1000) | (IR_reading == 0b1100))
+        else if ((IR_reading == 0b1000) ||
+                 (IR_reading == 0b0100) ||
+                 (IR_reading == 0b1100) ||
+                 (IR_reading == 0b1110))
         {
             movement = left; // if messed up change to right
         }
-        else if (IR_reading == 0b1110)
-        {
-            // movement = soft_left;
-            movement = left;
-        }
-        else if (IR_reading == 0b0111)
-        {
-            // movement = soft_right;
-            movement = right;
-        }
         /*
-        else if (IR_reading == 0b1110) { // Remove this from right condition
-            movement = hard_left;
-        }
-        else if (IR_reading == 0b1110) { // Remove this from right condition
-            movement = hard_right;
-        }
+        Special Case:
+            When turning left or right sometimes the robot will catch all four
+            sensors on the line, in which case it has turned too far and must
+            correct itself by turning the opposite direction (see below)
         */
+        else if (IR_reading == 0b1111)
+        {
+            if ((movement == stop) || (movement == forward))
+                movement = forward;
+            else if (movement == left)
+                movement = right;
+            else if (movement == right)
+                movement = left;
+        }
 
         servo_speed_update();
 
